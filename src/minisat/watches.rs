@@ -1,6 +1,6 @@
+use super::index_map::IndexMap;
 use super::literal::{Lit, Var};
-use super::clause::{ClauseRef, ClauseAllocator};
-use super::index_map::{IndexMap};
+use super::clause::{Clause, ClauseRef, ClauseAllocator};
 use super::assignment::*;
 use super::propagation_trail::*;
 
@@ -17,24 +17,17 @@ struct WatchesLine {
     dirty    : bool
 }
 
-impl WatchesLine {
-    #[inline]
-    fn clean(&mut self, ca : &ClauseAllocator) {
-        if self.dirty {
-            self.watchers.retain(|w| { !ca[w.cref].is_deleted() });
-            self.dirty = false;
-        }
-    }
-}
-
 
 pub struct Watches {
-    watches : IndexMap<Lit, WatchesLine>
+    watches          : IndexMap<Lit, WatchesLine>,
+    pub propagations : u64
 }
 
 impl Watches {
     pub fn new() -> Watches {
-        Watches { watches : IndexMap::new() }
+        Watches { watches      : IndexMap::new()
+                , propagations : 0
+                }
     }
 
     pub fn initVar(&mut self, var : Var) {
@@ -42,7 +35,7 @@ impl Watches {
         self.initLit(Lit::new(var, true));
     }
 
-    pub fn initLit(&mut self, lit : Lit) {
+    fn initLit(&mut self, lit : Lit) {
         self.watches.insert(&lit, WatchesLine {
             watchers : Vec::new(),
             dirty    : false,
@@ -54,63 +47,77 @@ impl Watches {
         self.tryClearLit(Lit::new(var, true));
     }
 
-    pub fn tryClearLit(&mut self, lit : Lit) {
+    fn tryClearLit(&mut self, lit : Lit) {
         if self.watches[&lit].watchers.is_empty() {
             self.watches.remove(&lit);
         }
     }
 
-    pub fn watch(&mut self, lit : Lit, cr : ClauseRef, blocker : Lit) {
-        self.watches[&!lit].watchers.push(Watcher { cref : cr, blocker : blocker });
+    pub fn watchClause(&mut self, c : &Clause, cr : ClauseRef) {
+        assert!(c.len() > 1);
+        self.watches[&!c[0]].watchers.push(Watcher { cref : cr, blocker : c[1] });
+        self.watches[&!c[1]].watchers.push(Watcher { cref : cr, blocker : c[0] });
     }
 
-    pub fn unwatch(&mut self, lit : Lit, cr : ClauseRef, strict : bool) {
-        let wl = &mut self.watches[&!lit];
-        if strict {
-            wl.watchers.retain(|w| w.cref != cr);
-        } else {
-            wl.dirty = true;
-        }
+    pub fn unwatchClauseStrict(&mut self, c : &Clause, cr : ClauseRef)
+    {
+        assert!(c.len() > 1);
+        self.watches[&!c[0]].watchers.retain(|w| w.cref != cr);
+        self.watches[&!c[1]].watchers.retain(|w| w.cref != cr);
     }
 
-    pub fn propagate(&mut self, trail : &mut PropagationTrail<Lit>, assigns : &mut Assignment, ca : &mut ClauseAllocator) -> (Option<ClauseRef>, u64) {
-        let mut confl = None;
-        let mut num_props = 0;
+    pub fn unwatchClauseLazy(&mut self, c : &Clause)
+    {
+        assert!(c.len() > 1);
+        self.watches[&!c[0]].dirty = true;
+        self.watches[&!c[1]].dirty = true;
+    }
 
-        loop {
-            let p = match trail.dequeue() { Some(p) => p, None => break }; // 'p' is enqueued fact to propagate.
-            num_props += 1;
+    // Description:
+    //   Propagates all enqueued facts. If a conflict arises, the conflicting clause is returned,
+    //   otherwise CRef_Undef.
+    //
+    //   Post-conditions:
+    //     * the propagation queue is empty, even if there was a conflict.
+    pub fn propagate(&mut self, trail : &mut PropagationTrail<Lit>, assigns : &mut Assignment, ca : &mut ClauseAllocator) -> Option<ClauseRef> {
+        while let Some(p) = trail.dequeue() {
+            self.propagations += 1;
             let false_lit = !p;
 
-            self.watches[&p].clean(ca);
+            {
+                let ref mut line = self.watches[&p];
+                if line.dirty {
+                    line.watchers.retain(|w| { !ca[w.cref].is_deleted() });
+                    line.dirty = false;
+                }
+            }
 
             let mut i = 0;
             let mut j = 0;
             loop {
-                let (cw, first, new_watch) = {
+                let (cw, new_watch) = {
                     let ref mut p_watches = self.watches[&p].watchers;
                     if i >= p_watches.len() { break; }
+                    let pwi = p_watches[i].clone();
+                    i += 1;
 
-                    let cw = p_watches[i].clone();
-                    if assigns.sat(cw.blocker) {
-                        p_watches[j] = p_watches[i].clone();
-                        i += 1;
+                    if assigns.sat(pwi.blocker) {
+                        p_watches[j] = pwi;
                         j += 1;
                         continue;
                     }
 
-                    let ref mut c = ca[cw.cref];
+                    let c = ca.edit(pwi.cref);
                     if c[0] == false_lit {
                         c[0] = c[1];
                         c[1] = false_lit;
                     }
                     assert!(c[1] == false_lit);
-                    i += 1;
 
                     // If 0th watch is true, then clause is already satisfied.
-                    let first = c[0];
-                    if first != cw.blocker && assigns.sat(first) {
-                        p_watches[j] = Watcher { cref : cw.cref, blocker : first };
+                    let cw = Watcher { cref : pwi.cref, blocker : c[0] };
+                    if cw.blocker != pwi.blocker && assigns.sat(cw.blocker) {
+                        p_watches[j] = cw;
                         j += 1;
                         continue;
                     }
@@ -119,31 +126,29 @@ impl Watches {
                     let mut new_watch = None;
                     for k in 2 .. c.len() {
                         if !assigns.unsat(c[k]) {
-                            new_watch = Some(k);
+                            let lit = c[k];
+                            c[1] = lit;
+                            c[k] = false_lit;
+                            new_watch = Some(lit);
                             break;
                         }
                     }
 
-                    (cw, first, new_watch)
+                    (cw, new_watch)
                 };
 
                 match new_watch {
-                    Some(k) => {
-                        let ref mut c = ca[cw.cref];
-                        let lit = c[k];
-                        c[1] = lit;
-                        c[k] = false_lit;
-                        self.watch(lit, cw.cref, first);
+                    Some(lit) => {
+                        self.watches[&!lit].watchers.push(cw);
                     }
 
                     // Did not find watch -- clause is unit under assignment:
-                    None    => {
+                    None      => {
                         let ref mut p_watches = self.watches[&p].watchers;
-                        p_watches[j] = Watcher { cref : cw.cref, blocker : first };
+                        p_watches[j] = cw.clone();
                         j += 1;
 
-                        if assigns.unsat(first) {
-                            confl = Some(cw.cref);
+                        if assigns.unsat(cw.blocker) {
                             trail.dequeueAll();
 
                             // Copy the remaining watches:
@@ -152,9 +157,12 @@ impl Watches {
                                 j += 1;
                                 i += 1;
                             }
+
+                            p_watches.truncate(j);
+                            return Some(cw.cref);
                         } else {
-                            assigns.assignLit(first, VarData { level : trail.decisionLevel(), reason : Some(cw.cref) });
-                            trail.push(first);
+                            assigns.assignLit(cw.blocker, trail.decisionLevel(), Some(cw.cref));
+                            trail.push(cw.blocker);
                         }
                     }
                 }
@@ -163,12 +171,13 @@ impl Watches {
             self.watches[&p].watchers.truncate(j);
         }
 
-        (confl, num_props)
+        None
     }
 
     pub fn relocGC(&mut self, from : &mut ClauseAllocator, to : &mut ClauseAllocator) {
         self.watches.modify_in_place(|line| {
-            line.clean(from);
+            line.dirty = false;
+            line.watchers.retain(|w| { !from[w.cref].is_deleted() });
             for w in line.watchers.iter_mut() {
                 w.cref = from.relocTo(to, w.cref);
             }

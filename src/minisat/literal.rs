@@ -1,6 +1,6 @@
 use std::fmt;
-use std::ops::{Not, BitXor};
-use super::index_map::{HasIndex};
+use std::ops;
+use super::index_map::HasIndex;
 
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, Copy, Clone)]
@@ -63,7 +63,7 @@ impl HasIndex for Lit {
     }
 }
 
-impl Not for Lit {
+impl ops::Not for Lit {
     type Output = Lit;
 
     #[inline]
@@ -73,7 +73,7 @@ impl Not for Lit {
     }
 }
 
-impl BitXor<bool> for Lit {
+impl ops::BitXor<bool> for Lit {
     type Output = Lit;
 
     #[inline]
@@ -85,6 +85,6 @@ impl BitXor<bool> for Lit {
 
 impl fmt::Display for Lit {
     fn fmt(&self, f : &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}{}", if self.sign() { "~" } else { "" }, self.var())
+        write!(f, "{}{}", if self.sign() { "¬" } else { "" }, self.var())
     }
 }
