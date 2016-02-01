@@ -1,4 +1,5 @@
 #![allow(non_snake_case)]
+#![allow(non_upper_case_globals)]
 
 extern crate time;
 extern crate vec_map;
@@ -10,6 +11,7 @@ use std::default::Default;
 use std::fs;
 use std::io;
 use std::io::Write;
+use minisat::formula::index_map::VarMap;
 use minisat::decision_heuristic::PhaseSaving;
 use minisat::conflict::CCMinMode;
 use minisat::solver;
@@ -144,38 +146,38 @@ fn main() {
         }
 
         for x in matches.value_of("min-learnts").and_then(|s| s.parse().ok()).iter() {
-            if 0 <= *x { s.core.min_learnts_lim = *x; }
+            if 0 <= *x { s.learnt.min_learnts_lim = *x; }
         }
 
         s
     };
 
     let simp_options = {
-        let mut s : solver::simp::SimpSettings = Default::default();
+        let mut s : solver::simp::Settings = Default::default();
 
-        if matches.is_present("asymm") { s.use_asymm = true; }
-        if matches.is_present("no-asymm") { s.use_asymm = false; }
+        if matches.is_present("asymm") { s.simp.use_asymm = true; }
+        if matches.is_present("no-asymm") { s.simp.use_asymm = false; }
 
-        if matches.is_present("rcheck") { s.use_rcheck = true; }
-        if matches.is_present("no-rcheck") { s.use_rcheck = false; }
+        if matches.is_present("rcheck") { s.simp.use_rcheck = true; }
+        if matches.is_present("no-rcheck") { s.simp.use_rcheck = false; }
 
-        if matches.is_present("elim") { s.use_elim = true; }
-        if matches.is_present("no-elim") { s.use_elim = false; }
+        if matches.is_present("elim") { s.simp.use_elim = true; }
+        if matches.is_present("no-elim") { s.simp.use_elim = false; }
 
         for x in matches.value_of("grow").and_then(|s| s.parse().ok()).iter() {
-            s.grow = *x;
+            s.simp.grow = *x;
         }
 
         for x in matches.value_of("cl-lim").and_then(|s| s.parse().ok()).iter() {
-            if -1 <= *x { s.clause_lim = *x; }
+            if -1 <= *x { s.simp.clause_lim = *x; }
         }
 
         for x in matches.value_of("sub-lim").and_then(|s| s.parse().ok()).iter() {
-            if -1 <= *x { s.subsumption_lim = *x; }
+            if -1 <= *x { s.simp.subsumption_lim = *x; }
         }
 
         for x in matches.value_of("simp-gc-frac").and_then(|s| s.parse().ok()).iter() {
-            if 0.0 < *x && *x <= 1.0 { s.simp_garbage_frac = *x; }
+            if 0.0 < *x && *x <= 1.0 { s.simp.simp_garbage_frac = *x; }
         }
 
         s
@@ -196,7 +198,7 @@ fn main() {
         solveFileCore(solver, options).expect("Error");
     } else {
         let solver = solver::simp::SimpSolver::new(core_options, simp_options);
-        simpFileSimp(solver, options).expect("Error");
+        solveFileSimp(solver, options).expect("Error");
     }
 }
 
@@ -206,10 +208,10 @@ fn solveFileCore(mut solver : solver::CoreSolver, options : MainOptions) -> io::
     info!("============================[ Problem Statistics ]=============================");
     info!("|                                                                             |");
 
-    {
+    let backward_subst = {
         let in_file = try!(fs::File::open(options.in_path));
-        try!(dimacs::parse(&mut io::BufReader::new(in_file), &mut solver, options.strict));
-    }
+        try!(dimacs::parse(&mut io::BufReader::new(in_file), &mut solver, options.strict))
+    };
 
     info!("|  Number of variables:  {:12}                                         |", solver.nVars());
     info!("|  Number of clauses:    {:12}                                         |", solver.nClauses());
@@ -233,23 +235,23 @@ fn solveFileCore(mut solver : solver::CoreSolver, options : MainOptions) -> io::
     printOutcome(&result);
     if let Some(path) = options.out_path {
         let mut out = try!(fs::File::create(path));
-        try!(writetResultTo(&mut out, result));
+        try!(writeResultTo(&mut out, backward_subst, result));
     }
 
     Ok(())
 }
 
-fn simpFileSimp(mut solver : solver::simp::SimpSolver, options : MainOptions) -> io::Result<()> {
+fn solveFileSimp(mut solver : solver::simp::SimpSolver, options : MainOptions) -> io::Result<()> {
     if !options.pre { solver.eliminate(true); }
     let initial_time = time::precise_time_s();
 
     info!("============================[ Problem Statistics ]=============================");
     info!("|                                                                             |");
 
-    {
+    let backward_subst = {
         let in_file = try!(fs::File::open(options.in_path));
-        try!(dimacs::parse(&mut io::BufReader::new(in_file), &mut solver, options.strict));
-    }
+        try!(dimacs::parse(&mut io::BufReader::new(in_file), &mut solver, options.strict))
+    };
 
     info!("|  Number of variables:  {:12}                                         |", solver.nVars());
     info!("|  Number of clauses:    {:12}                                         |", solver.nClauses());
@@ -293,7 +295,7 @@ fn simpFileSimp(mut solver : solver::simp::SimpSolver, options : MainOptions) ->
     printOutcome(&result);
     if let Some(path) = options.out_path {
         let mut out = try!(fs::File::create(path));
-        try!(writetResultTo(&mut out, result));
+        try!(writeResultTo(&mut out, backward_subst, result));
     }
 
     Ok(())
@@ -308,25 +310,21 @@ fn printOutcome(ret : &PartialResult) {
         });
 }
 
-fn writetResultTo<W : io::Write>(stream : &mut W, ret : PartialResult) -> io::Result<()> {
+fn writeResultTo<W : io::Write>(stream : &mut W, backward_subst : VarMap<i32>, ret : PartialResult) -> io::Result<()> {
     match ret {
         PartialResult::UnSAT          => { try!(writeln!(stream, "UNSAT")); Ok(()) }
         PartialResult::Interrupted(_) => { try!(writeln!(stream, "INDET")); Ok(()) }
         PartialResult::SAT(model)     => {
             try!(writeln!(stream, "SAT"));
-            writeModelTo(stream, &model)
+            writeModelTo(stream, backward_subst, model)
         }
     }
 }
 
-fn writeModelTo<W : io::Write>(stream : &mut W, model : &Vec<Option<bool>>) -> io::Result<()> {
-    for i in 0 .. model.len() {
-        let var_id = i + 1;
-        match model[i] {
-            None        => {}
-            Some(true)  => { try!(write!(stream, "{} ", var_id)); }
-            Some(false) => { try!(write!(stream, "-{} ", var_id)); }
-        }
+fn writeModelTo<W : io::Write>(stream : &mut W, backward_subst : VarMap<i32>, model : VarMap<bool>) -> io::Result<()> {
+    for (var, val) in model.iter() {
+        let var_id = backward_subst[&var];
+        try!(write!(stream, "{} ", if *val { var_id } else { -var_id }));
     }
     try!(writeln!(stream, "0"));
     Ok(())

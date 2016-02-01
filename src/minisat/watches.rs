@@ -1,8 +1,8 @@
-use super::index_map::IndexMap;
-use super::literal::{Lit, Var};
-use super::clause::{Clause, ClauseRef, ClauseAllocator};
-use super::assignment::*;
-use super::propagation_trail::*;
+use minisat::formula::{Lit, Var};
+use minisat::formula::index_map::LitMap;
+use minisat::formula::clause::*;
+use minisat::formula::assignment::*;
+use minisat::propagation_trail::*;
 
 
 #[derive(Clone)]
@@ -19,13 +19,13 @@ struct WatchesLine {
 
 
 pub struct Watches {
-    watches          : IndexMap<Lit, WatchesLine>,
+    watches          : LitMap<WatchesLine>,
     pub propagations : u64
 }
 
 impl Watches {
     pub fn new() -> Watches {
-        Watches { watches      : IndexMap::new()
+        Watches { watches      : LitMap::new()
                 , propagations : 0
                 }
     }
@@ -175,12 +175,12 @@ impl Watches {
     }
 
     pub fn relocGC(&mut self, from : &mut ClauseAllocator, to : &mut ClauseAllocator) {
-        self.watches.modify_in_place(|line| {
+        for (_, line) in self.watches.iter_mut() {
             line.dirty = false;
             line.watchers.retain(|w| { !from[w.cref].is_deleted() });
             for w in line.watchers.iter_mut() {
                 w.cref = from.relocTo(to, w.cref);
             }
-        });
+        }
     }
 }

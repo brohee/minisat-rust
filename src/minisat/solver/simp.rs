@@ -1,53 +1,39 @@
+use std::borrow::Borrow;
 use std::default::Default;
 use std::collections::vec_deque::VecDeque;
 use std::mem;
-use std::borrow::Borrow;
-use minisat::index_map::{HasIndex, IndexMap};
-use minisat::literal::{Var, Lit};
-use minisat::clause::{Clause, ClauseRef, ClauseAllocator, SubsumesRes, subsumes};
-use minisat::assignment::*;
+use minisat::formula::{Var, Lit, TempLit};
+use minisat::formula::clause::*;
+use minisat::formula::assignment::*;
+use minisat::formula::index_map::{VarMap, LitMap};
 use super::Solver;
 
-
-pub struct SimpSettings {
-    pub grow              : usize, // Allow a variable elimination step to grow by a number of clauses (default to zero).
-    pub clause_lim        : i32,   // Variables are not eliminated if it produces a resolvent with a length above this limit. -1 means no limit.
-    pub subsumption_lim   : i32,   // Do not check if subsumption against a clause larger than this. -1 means no limit.
-    pub simp_garbage_frac : f64,   // A different limit for when to issue a GC during simplification (Also see 'garbage_frac').
-    pub use_asymm         : bool,  // Shrink clauses by asymmetric branching.
-    pub use_rcheck        : bool,  // Check if a clause is already implied. Pretty costly, and subsumes subsumptions :)
-    pub use_elim          : bool,  // Perform variable elimination.
-    pub extend_model      : bool,  // Flag to indicate whether the user needs to look at the full model.
+pub struct Settings {
+    pub simp         : SimpSettings,
+    pub extend_model : bool // Flag to indicate whether the user needs to look at the full model.
 }
 
-impl Default for SimpSettings {
-    fn default() -> SimpSettings {
-        SimpSettings {
-            grow              : 0,
-            clause_lim        : 20,
-            subsumption_lim   : 1000,
-            simp_garbage_frac : 0.5,
-            use_asymm         : false,
-            use_rcheck        : false,
-            use_elim          : true,
-            extend_model      : true,
+impl Default for Settings {
+    fn default() -> Settings {
+        Settings {
+            simp         : Default::default(),
+            extend_model : true
         }
     }
 }
 
-
 struct ElimQueue {
     heap    : Vec<Var>,
-    indices : IndexMap<Var, usize>,
-    n_occ   : IndexMap<Lit, i32>,
+    indices : VarMap<usize>,
+    n_occ   : LitMap<i32>
 }
 
 impl ElimQueue {
     pub fn new() -> ElimQueue {
         ElimQueue {
             heap    : Vec::new(),
-            indices : IndexMap::new(),
-            n_occ   : IndexMap::new()
+            indices : VarMap::new(),
+            n_occ   : LitMap::new()
         }
     }
 
@@ -85,7 +71,7 @@ impl ElimQueue {
         }
     }
 
-    fn updateElimHeap(&mut self, v : &Var, frozen : &IndexMap<Var, i8>, eliminated : &IndexMap<Var, i8>, assigns : &Assignment) {
+    fn updateElimHeap(&mut self, v : &Var, frozen : &VarMap<i8>, eliminated : &VarMap<i8>, assigns : &Assignment) {
         if self.inHeap(&v) || (frozen[v] == 0 && eliminated[v] == 0 && assigns.undef(*v)) {
             self.update(*v);
         }
@@ -185,12 +171,12 @@ struct OccLine {
 }
 
 struct OccLists {
-    occs : IndexMap<Var, OccLine>
+    occs : VarMap<OccLine>
 }
 
 impl OccLists {
     pub fn new() -> OccLists {
-        OccLists { occs : IndexMap::new() }
+        OccLists { occs : VarMap::new() }
     }
 
     pub fn initVar(&mut self, v : &Var) {
@@ -234,7 +220,7 @@ impl OccLists {
     }
 
     pub fn relocGC(&mut self, from : &mut ClauseAllocator, to : &mut ClauseAllocator) {
-        self.occs.modify_in_place(|ol| {
+        for (_, ol) in self.occs.iter_mut() {
             if ol.dirty {
                 ol.occs.retain(|cr| { !from[*cr].is_deleted() });
                 ol.dirty = false;
@@ -243,7 +229,32 @@ impl OccLists {
             for occ in ol.occs.iter_mut() {
                 *occ = from.relocTo(to, *occ);
             }
-        });
+        }
+    }
+}
+
+
+pub struct SimpSettings {
+    pub grow              : usize, // Allow a variable elimination step to grow by a number of clauses (default to zero).
+    pub clause_lim        : i32,   // Variables are not eliminated if it produces a resolvent with a length above this limit. -1 means no limit.
+    pub subsumption_lim   : i32,   // Do not check if subsumption against a clause larger than this. -1 means no limit.
+    pub simp_garbage_frac : f64,   // A different limit for when to issue a GC during simplification (Also see 'garbage_frac').
+    pub use_asymm         : bool,  // Shrink clauses by asymmetric branching.
+    pub use_rcheck        : bool,  // Check if a clause is already implied. Prett costly, and subsumes subsumptions :)
+    pub use_elim          : bool   // Perform variable elimination.
+}
+
+impl Default for SimpSettings {
+    fn default() -> SimpSettings {
+        SimpSettings {
+            grow              : 0,
+            clause_lim        : 20,
+            subsumption_lim   : 1000,
+            simp_garbage_frac : 0.5,
+            use_asymm         : false,
+            use_rcheck        : false,
+            use_elim          : true
+        }
     }
 }
 
@@ -259,16 +270,15 @@ pub struct SimpSolver {
 
     // Solver state:
     use_simplification : bool,
-    max_simp_var       : Var,        // Max variable at the point simplification was turned off.
-    elimclauses        : Vec<u32>,
-    touched            : IndexMap<Var, i8>,
+    elimclauses        : ElimClauses,
+    touched            : VarMap<i8>,
 
     occurs             : OccLists,
     elim               : ElimQueue,
     subsumption_queue  : VecDeque<ClauseRef>,
-    frozen             : IndexMap<Var, i8>,
+    frozen             : VarMap<i8>,
     frozen_vars        : Vec<Var>,
-    eliminated         : IndexMap<Var, i8>,
+    eliminated         : VarMap<i8>,
     bwdsub_assigns     : usize,
     n_touched          : usize,
 
@@ -345,29 +355,28 @@ impl Solver for SimpSolver {
 
 impl SimpSolver {
 
-    pub fn new(core_s : super::Settings, simp_s : SimpSettings) -> SimpSolver {
+    pub fn new(core_s : super::Settings, simp_s : Settings) -> SimpSolver {
         let mut s = super::CoreSolver::new(core_s);
         s.db.ca.set_extra_clause_field(true); // NOTE: must happen before allocating the dummy clause below.
         s.db.settings.remove_satisfied = false;
-        let temp_clause = s.db.ca.alloc(&vec![Lit::fromIndex(0)], false);
+        let temp_clause = s.db.ca.alloc(&vec![TempLit], false);
         SimpSolver { core               : s
-                   , set                : simp_s
+                   , set                : simp_s.simp
 
                    , merges             : 0
                    , asymm_lits         : 0
                    , eliminated_vars    : 0
 
                    , use_simplification : true
-                   , max_simp_var       : Var::new(0)
-                   , elimclauses        : Vec::new()
-                   , touched            : IndexMap::new()
+                   , elimclauses        : ElimClauses::new(simp_s.extend_model)
+                   , touched            : VarMap::new()
 
                    , occurs             : OccLists::new()
                    , elim               : ElimQueue::new()
                    , subsumption_queue  : VecDeque::new()
-                   , frozen             : IndexMap::new()
+                   , frozen             : VarMap::new()
                    , frozen_vars        : Vec::new()
-                   , eliminated         : IndexMap::new()
+                   , eliminated         : VarMap::new()
                    , bwdsub_assigns     : 0
                    , n_touched          : 0
 
@@ -425,16 +434,11 @@ impl SimpSolver {
 
         let result =
             if elim_result {
-                match self.core.solve_() {
-                    super::PartialResult::SAT(mut model) => {
-                        if self.set.extend_model {
-                            extendModel(&self.elimclauses, &mut model);
-                        }
-                        super::PartialResult::SAT(model)
-                    }
-
-                    res => { res }
+                let mut result = self.core.solve_();
+                if let super::PartialResult::SAT(ref mut model) = result {
+                    self.elimclauses.extendModel(model);
                 }
+                result
             } else {
                 info!("===============================================================================");
                 super::PartialResult::UnSAT
@@ -527,7 +531,6 @@ impl SimpSolver {
             self.use_simplification = false;
             self.core.db.settings.remove_satisfied = true;
             self.core.db.ca.set_extra_clause_field(false);
-            self.max_simp_var = Var::new(self.core.nVars());
 
             // Force full cleanup (this is safe and desirable since it only happens once):
             self.core.heur.rebuildOrderHeap(&self.core.assigns);
@@ -539,11 +542,7 @@ impl SimpSolver {
             }
         }
 
-        if self.elimclauses.len() > 0 {
-            info!("|  Eliminated clauses:     {:10.2} Mb                                      |",
-                  ((self.elimclauses.len() * mem::size_of::<u32>()) as f64) / (1024.0 * 1024.0));
-        }
-
+        self.elimclauses.logSize();
         self.core.ok
     }
 
@@ -726,14 +725,14 @@ impl SimpSolver {
 
         if pos.len() > neg.len() {
             for cr in neg.iter() {
-                mkElimClause(&mut self.elimclauses, v, &self.core.db.ca[*cr]);
+                self.elimclauses.mkElimClause(v, &self.core.db.ca[*cr]);
             }
-            mkElimUnit(&mut self.elimclauses, Lit::new(v, false));
+            self.elimclauses.mkElimUnit(Lit::new(v, false));
         } else {
             for cr in pos.iter() {
-                mkElimClause(&mut self.elimclauses, v, &self.core.db.ca[*cr]);
+                self.elimclauses.mkElimClause(v, &self.core.db.ca[*cr]);
             }
-            mkElimUnit(&mut self.elimclauses, Lit::new(v, true));
+            self.elimclauses.mkElimUnit(Lit::new(v, true));
         }
 
         for cr in cls.iter() {
@@ -860,9 +859,8 @@ impl SimpSolver {
             }
         }
 
-        for i in 0 .. self.core.nVars() {
-            let v = Var::new(i);
-            if self.touched[&v] != 0 {
+        for (v, touched) in self.touched.iter_mut() {
+            if *touched != 0 {
                 for cr in self.occurs.lookup(&v, &self.core.db.ca) {
                     let c = self.core.db.ca.edit(*cr);
                     if c.mark() == 0 {
@@ -870,7 +868,7 @@ impl SimpSolver {
                         c.setMark(2);
                     }
                 }
-                self.touched[&v] = 0;
+                *touched = 0;
             }
         }
 
@@ -911,63 +909,89 @@ impl SimpSolver {
 }
 
 
-fn mkElimUnit(elimclauses : &mut Vec<u32>, x : Lit) {
-    elimclauses.push(x.toIndex() as u32);
-    elimclauses.push(1);
+struct ElimClauses {
+    extend_model : bool,
+    literals     : Vec<Lit>,
+    sizes        : Vec<usize>
 }
 
-
-fn mkElimClause(elimclauses : &mut Vec<u32>, v : Var, c : &Clause) {
-    let first = elimclauses.len();
-    let mut v_pos = 0;
-
-    // Copy clause to elimclauses-vector. Remember position where the
-    // variable 'v' occurs:
-    for i in 0 .. c.len() {
-        elimclauses.push(c[i].toIndex() as u32);
-        if c[i].var() == v {
-            v_pos = i + first;
-        }
+impl ElimClauses {
+    pub fn new(extend_model : bool) -> ElimClauses {
+        ElimClauses { extend_model : extend_model
+                    , literals     : Vec::new()
+                    , sizes        : Vec::new()
+                    }
     }
-    assert!(v_pos > 0);
 
-    // Swap the first literal with the 'v' literal, so that the literal
-    // containing 'v' will occur first in the clause:
-    elimclauses.swap(first, v_pos);
+    pub fn mkElimUnit(&mut self, x : Lit) {
+        self.literals.push(x);
+        self.sizes.push(1);
+    }
 
-    // Store the length of the clause last:
-    elimclauses.push(c.len() as u32);
-}
+    pub fn mkElimClause(&mut self, v : Var, c : &Clause) {
+        let first = self.literals.len();
 
-fn extendModel(elimclauses : &Vec<u32>, model : &mut Vec<Option<bool>>) {
-    if elimclauses.is_empty() { return; }
+        // Copy clause to elimclauses-vector. Remember position where the
+        // variable 'v' occurs:
+        let mut v_pos = 0;
+        let mut v_found = false;
+        for i in 0 .. c.len() {
+            self.literals.push(c[i]);
+            if c[i].var() == v {
+                v_pos = i + first;
+                v_found = true;
+            }
+        }
+        assert!(v_found);
 
-    let mut i = elimclauses.len() - 1;
-    while i > 0 {
-        let mut j = elimclauses[i] as usize;
-        i -= 1;
-        let mut skip = false;
+        // Swap the first literal with the 'v' literal, so that the literal
+        // containing 'v' will occur first in the clause:
+        self.literals.swap(first, v_pos);
 
-        while j > 1 {
-            let x = Lit::fromIndex(elimclauses[i] as usize);
-            match model[x.var().toIndex()] {
-                Some(s) if s == x.sign() => {}
-                _                        => { skip = true; break; }
+        // Store the length of the clause last:
+        self.sizes.push(c.len());
+    }
+
+    pub fn extendModel(&self, model : &mut VarMap<bool>) {
+        if !self.extend_model { return; }
+
+        let mut i = self.literals.len();
+        let mut cl = self.sizes.len();
+        while cl > 0 && i > 0 {
+            cl -= 1;
+            let mut j = self.sizes[cl];
+            assert!(j > 0);
+
+            i -= 1;
+            let mut skip = false;
+            while j > 1 {
+                let x = self.literals[i];
+                match model.get(&x.var()) {
+                    Some(s) if *s == x.sign() => {}
+                    _                         => { skip = true; break; }
+                }
+
+                j -= 1;
+                i -= 1;
             }
 
-            j -= 1;
-            i -= 1;
-        }
+            if !skip {
+                let x = self.literals[i];
+                model.insert(&x.var(), !x.sign());
+            }
 
-        if !skip {
-            let x = Lit::fromIndex(elimclauses[i] as usize);
-            model[x.var().toIndex()] = Some(!x.sign());
+            if i > j - 1 {
+                i -= j - 1;
+            } else {
+                i = 0
+            }
         }
+    }
 
-        if i > j {
-            i -= j;
-        } else {
-            i = 0;
+    pub fn logSize(&self) {
+        let sz = self.literals.len() + self.sizes.len();
+        if sz > 0 {
+            info!("|  Eliminated clauses:     {:10.2} Mb                                      |", ((sz * mem::size_of::<u32>()) as f64) / (1024.0 * 1024.0));
         }
     }
 }

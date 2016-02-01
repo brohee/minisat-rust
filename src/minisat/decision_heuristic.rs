@@ -1,8 +1,8 @@
 use std::ops;
-use super::index_map::{HasIndex, IndexMap};
-use super::random;
-use super::literal::{Var, Lit};
-use super::assignment::*;
+use minisat::formula::{Var, Lit};
+use minisat::formula::assignment::*;
+use minisat::formula::index_map::VarMap;
+use minisat::random;
 
 
 #[derive(PartialEq, Eq)]
@@ -41,8 +41,8 @@ pub struct DecisionHeuristic {
     settings          : DecisionHeuristicSettings,
     var_inc           : f64,                         // Amount to bump next variable with.
     rand              : random::Random,
-    var               : IndexMap<Var, VarLine>,
-    activity_queue    : ActivityQueue<Var>,          // A priority queue of variables ordered with respect to the variable activity.
+    var               : VarMap<VarLine>,
+    activity_queue    : ActivityQueue,               // A priority queue of variables ordered with respect to the variable activity.
 
     pub dec_vars      : usize,
     pub rnd_decisions : u64
@@ -54,7 +54,7 @@ impl DecisionHeuristic {
         DecisionHeuristic { settings       : settings
                           , var_inc        : 1.0
                           , rand           : random::Random::new(seed)
-                          , var            : IndexMap::new()
+                          , var            : VarMap::new()
                           , activity_queue : ActivityQueue::new()
                           , dec_vars       : 0
                           , rnd_decisions  : 0
@@ -114,10 +114,9 @@ impl DecisionHeuristic {
     }
 
     pub fn rebuildOrderHeap(&mut self, assigns : &Assignment) {
-        let mut tmp = Vec::new();
-        for vi in 0 .. assigns.nVars() {
-            let v = Var::new(vi);
-            if self.var[&v].decision && assigns.undef(v) {
+        let mut tmp = Vec::with_capacity(self.activity_queue.len());
+        for (v, vl) in self.var.iter() {
+            if vl.decision && assigns.undef(v) {
                 tmp.push(v);
             }
         }
@@ -165,18 +164,18 @@ impl DecisionHeuristic {
 }
 
 
-struct ActivityQueue<V : HasIndex> {
-    heap     : Vec<V>,
-    indices  : IndexMap<V, usize>,
-    activity : IndexMap<V, f64>,
+struct ActivityQueue {
+    heap     : Vec<Var>,
+    indices  : VarMap<usize>,
+    activity : VarMap<f64>,
 }
 
-impl<V : HasIndex> ActivityQueue<V> {
-    pub fn new() -> ActivityQueue<V> {
+impl ActivityQueue {
+    pub fn new() -> ActivityQueue {
         ActivityQueue {
             heap     : Vec::new(),
-            indices  : IndexMap::new(),
-            activity : IndexMap::new(),
+            indices  : VarMap::new(),
+            activity : VarMap::new(),
         }
     }
 
@@ -191,22 +190,22 @@ impl<V : HasIndex> ActivityQueue<V> {
     }
 
     #[inline]
-    pub fn contains(&self, v : &V) -> bool {
+    pub fn contains(&self, v : &Var) -> bool {
         self.indices.contains_key(v)
     }
 
     #[inline]
-    pub fn getActivity(&self, v : &V) -> f64 {
+    pub fn getActivity(&self, v : &Var) -> f64 {
         self.activity[v]
     }
 
     pub fn scaleActivity(&mut self, factor : f64) {
-        self.activity.modify_in_place(|act| { *act *= factor });
+        for (_, act) in self.activity.iter_mut() {
+            *act *= factor;
+        }
     }
-}
 
-impl<V : HasIndex + Clone> ActivityQueue<V> {
-    pub fn setActivity(&mut self, v : &V, new : f64) {
+    pub fn setActivity(&mut self, v : &Var, new : f64) {
         match self.activity.insert(v, new) {
             None      => {}
             Some(old) => {
@@ -218,7 +217,7 @@ impl<V : HasIndex + Clone> ActivityQueue<V> {
         }
     }
 
-    pub fn insert(&mut self, v : V) {
+    pub fn insert(&mut self, v : Var) {
         if !self.contains(&v) {
             if !self.activity.contains_key(&v) {
                 self.activity.insert(&v, 0.0);
@@ -231,7 +230,7 @@ impl<V : HasIndex + Clone> ActivityQueue<V> {
         }
     }
 
-    pub fn pop(&mut self) -> Option<V>
+    pub fn pop(&mut self) -> Option<Var>
     {
         match self.heap.len() {
             0 => { None }
@@ -253,7 +252,7 @@ impl<V : HasIndex + Clone> ActivityQueue<V> {
         }
     }
 
-    pub fn heapifyFrom(&mut self, from : Vec<V>) {
+    pub fn heapifyFrom(&mut self, from : Vec<Var>) {
         self.heap = from;
         self.indices.clear();
         for i in 0 .. self.heap.len() {
@@ -298,17 +297,17 @@ impl<V : HasIndex + Clone> ActivityQueue<V> {
     }
 
     #[inline]
-    fn set(&mut self, i : usize, v : V) {
+    fn set(&mut self, i : usize, v : Var) {
         self.indices.insert(&v, i);
         self.heap[i] = v;
     }
 }
 
-impl<V : HasIndex> ops::Index<usize> for ActivityQueue<V> {
-    type Output = V;
+impl ops::Index<usize> for ActivityQueue {
+    type Output = Var;
 
     #[inline]
-    fn index(&self, i : usize) -> &V {
+    fn index(&self, i : usize) -> &Var {
         self.heap.index(i)
     }
 }

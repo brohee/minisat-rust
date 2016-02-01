@@ -1,8 +1,8 @@
 use std::cmp::Ordering;
-use super::literal::Lit;
-use super::clause::*;
-use super::assignment::*;
-use super::watches::*;
+use minisat::formula::Lit;
+use minisat::formula::clause::*;
+use minisat::formula::assignment::*;
+use minisat::watches::*;
 
 
 pub struct ClauseDBSettings {
@@ -101,7 +101,7 @@ impl ClauseDB {
             self.cla_inc *= 1e-20;
             for cri in self.learnts.iter() {
                 let c = self.ca.edit(*cri);
-                let scaled = c.activity() * 1e-10;
+                let scaled = c.activity() * 1e-20;
                 c.setActivity(scaled);
             }
         }
@@ -143,7 +143,7 @@ impl ClauseDB {
 
                 let remove = {
                     let ref c = self.ca[cr];
-                    c.len() > 2 && !isLocked(&self.ca, assigns, cr)
+                    c.len() > 2 && !assigns.isLocked(&self.ca, cr)
                                 && (i < self.learnts.len() / 2 || c.activity() < extra_lim)
                 };
                 if remove {
