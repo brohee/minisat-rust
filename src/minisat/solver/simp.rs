@@ -240,7 +240,7 @@ pub struct SimpSettings {
     pub subsumption_lim   : i32,   // Do not check if subsumption against a clause larger than this. -1 means no limit.
     pub simp_garbage_frac : f64,   // A different limit for when to issue a GC during simplification (Also see 'garbage_frac').
     pub use_asymm         : bool,  // Shrink clauses by asymmetric branching.
-    pub use_rcheck        : bool,  // Check if a clause is already implied. Prett costly, and subsumes subsumptions :)
+    pub use_rcheck        : bool,  // Check if a clause is already implied. Pretty costly, and subsumes subsumptions :)
     pub use_elim          : bool   // Perform variable elimination.
 }
 
