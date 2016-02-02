@@ -9,7 +9,6 @@ use minisat::formula::index_map::{VarMap, LitMap};
 use minisat::clause_db::*;
 use minisat::conflict::*;
 use minisat::decision_heuristic::*;
-use minisat::propagation_trail::*;
 use minisat::watches::*;
 use minisat::util;
 
@@ -161,10 +160,10 @@ impl Budget {
         self.asynch_interrupt.load(atomic::Ordering::Relaxed)
     }
 
-    pub fn off(&mut self) {
-        self.conflict_budget = -1;
-        self.propagation_budget = -1;
-    }
+//    pub fn off(&mut self) {
+//        self.conflict_budget = -1;
+//        self.propagation_budget = -1;
+//    }
 }
 
 
@@ -198,12 +197,14 @@ pub enum PartialResult { UnSAT, SAT(VarMap<bool>), Interrupted(f64) }
 
 
 pub struct CoreSettings {
-    pub garbage_frac : f64, // The fraction of wasted memory allowed before a garbage collection is triggered.
+    pub garbage_frac : f64,  // The fraction of wasted memory allowed before a garbage collection is triggered.
+    pub use_rcheck   : bool, // Check if a clause is already implied. Prett costly, and subsumes subsumptions :)
 }
 
 impl Default for CoreSettings {
     fn default() -> CoreSettings {
         CoreSettings { garbage_frac : 0.20
+                     , use_rcheck   : false
                      }
     }
 }
@@ -230,8 +231,6 @@ pub struct CoreSolver {
     restart       : RestartStrategy,
     stats         : Stats,                  // Statistics: (read-only member variable)
     db            : ClauseDB,
-    trail         : PropagationTrail<Lit>,  // Assignment stack; stores all assigments made in the order they were made.
-    assumptions   : Vec<Lit>,               // Current set of assumptions provided to solve by the user.
     assigns       : Assignment,             // The current assignments.
     watches       : Watches,                // 'watches[lit]' is a list of constraints watching 'lit' (will go there if literal becomes true).
     heur          : DecisionHeuristic,
@@ -245,7 +244,7 @@ pub struct CoreSolver {
 
 impl Solver for CoreSolver {
     fn nVars(&self) -> usize {
-        self.assigns.nVars()
+        self.assigns.numberOfVars()
     }
 
     fn nClauses(&self) -> usize {
@@ -271,16 +270,16 @@ impl Solver for CoreSolver {
         let cpu_time = time::precise_time_s() - self.stats.start_time;
 
         info!("restarts              : {:<12}", self.stats.starts);
-        info!("conflicts             : {:<12}   ({:.0} / sec)",
+        info!("conflicts             : {:<12}   ({:.0} /sec)",
             self.stats.conflicts,
             (self.stats.conflicts as f64) / cpu_time);
 
-        info!("decisions             : {:<12}   ({:4.2} % random) ({:.0} / sec)",
+        info!("decisions             : {:<12}   ({:4.2} % random) ({:.0} /sec)",
             self.stats.decisions,
             (self.heur.rnd_decisions as f64) * 100.0 / (self.stats.decisions as f64),
             (self.stats.decisions as f64) / cpu_time);
 
-        info!("propagations          : {:<12}   ({:.0} / sec)",
+        info!("propagations          : {:<12}   ({:.0} /sec)",
             self.watches.propagations,
             (self.watches.propagations as f64) / cpu_time);
 
@@ -302,8 +301,6 @@ impl CoreSolver {
                    , restart       : settings.restart
                    , stats         : Stats::new()
                    , db            : ClauseDB::new(settings.db)
-                   , trail         : PropagationTrail::new()
-                   , assumptions   : Vec::new()
                    , assigns       : Assignment::new()
                    , watches       : Watches::new()
                    , heur          : DecisionHeuristic::new(settings.heur)
@@ -317,25 +314,29 @@ impl CoreSolver {
     }
 
     fn addClause_(&mut self, clause : &[Lit]) -> AddClause {
-        assert!(self.trail.isGroundLevel());
+        assert!(self.assigns.isGroundLevel());
         if !self.ok { return AddClause::UnSAT; }
 
-        let mut ps = clause.to_vec();
+        let ps = {
+            let mut ps = clause.to_vec();
 
-        // Check if clause is satisfied and remove false/duplicate literals:
-        ps.sort();
-        ps.dedup();
-        ps.retain(|lit| { !self.assigns.unsat(*lit) });
+            // Check if clause is satisfied and remove false/duplicate literals:
+            ps.sort();
+            ps.dedup();
+            ps.retain(|lit| { !self.assigns.isUnsat(*lit) });
 
-        {
-            let mut prev = None;
-            for lit in ps.iter() {
-                if self.assigns.sat(*lit) || prev == Some(!*lit) {
-                    return AddClause::Consumed;
+            {
+                let mut prev = None;
+                for lit in ps.iter() {
+                    if self.assigns.isSat(*lit) || prev == Some(!*lit) {
+                        return AddClause::Consumed;
+                    }
+                    prev = Some(*lit);
                 }
-                prev = Some(*lit);
             }
-        }
+
+            ps.into_boxed_slice()
+        };
 
         match ps.len() {
             0 => {
@@ -344,48 +345,47 @@ impl CoreSolver {
             }
 
             1 => {
-                self.uncheckedEnqueue(ps[0], None);
-                match self.propagate() {
+                self.assigns.assignLit(ps[0], None);
+                match self.watches.propagate(&mut self.db.ca, &mut self.assigns) {
                     None    => { AddClause::Consumed }
                     Some(_) => { self.ok = false; AddClause::UnSAT }
                 }
             }
 
             _ => {
-                let cr = self.db.addClause(&ps);
-                self.watches.watchClause(&self.db.ca[cr], cr);
-                AddClause::Added(cr)
+                if self.settings.use_rcheck && isImplied(self, &ps) {
+                    AddClause::Consumed
+                } else {
+                    let (c, cr) = self.db.addClause(ps);
+                    self.watches.watchClause(c, cr);
+                    AddClause::Added(cr)
+                }
             }
         }
     }
 
-    pub fn solve(&mut self, assumps : &[Lit]) -> bool {
-        self.budget.off();
-        match self.solveLimited(assumps) {
-            PartialResult::UnSAT  => { false }
-            PartialResult::SAT(_) => { true }
-            _                     => { panic!("Impossible happened") }
-        }
-    }
-
-    pub fn solveLimited(&mut self, assumps : &[Lit]) -> PartialResult {
-        self.assumptions = assumps.to_vec();
-        self.solve_()
-    }
+//    pub fn solve(&mut self, assumps : &[Lit]) -> bool {
+//        self.budget.off();
+//        match self.solveLimited(assumps) {
+//            PartialResult::UnSAT  => { false }
+//            PartialResult::SAT(_) => { true }
+//            _                     => { panic!("Impossible happened") }
+//        }
+//    }
 
     // Description:
     //   Simplify the clause database according to the current top-level assigment. Currently, the only
     //   thing done here is the removal of satisfied clauses, but more things can be put here.
     pub fn simplify(&mut self) -> bool {
-        assert!(self.trail.isGroundLevel());
+        assert!(self.assigns.isGroundLevel());
         if !self.ok { return false; }
 
-        if let Some(_) = self.propagate() {
+        if let Some(_) = self.watches.propagate(&mut self.db.ca, &mut self.assigns) {
             self.ok = false;
             return false;
         }
 
-        if self.simp.skip(self.trail.totalSize(), self.watches.propagations) {
+        if self.simp.skip(self.assigns.numberOfAssigns(), self.watches.propagations) {
             return true;
         }
 
@@ -401,7 +401,7 @@ impl CoreSolver {
 
             {
                 let seen = &self.analyze.seen;
-                self.trail.retain(|l| { seen[&l.var()] == Seen::Undef });
+                self.assigns.retainAssignments(|l| { seen[&l.var()] == Seen::Undef });
             }
 
             for v in self.released_vars.iter() {
@@ -421,26 +421,19 @@ impl CoreSolver {
 
         self.heur.rebuildOrderHeap(&self.assigns);
 
-        self.simp.setNext(self.trail.totalSize(), self.watches.propagations, self.db.clauses_literals + self.db.learnts_literals); // (shouldn't depend on stats really, but it will do for now)
+        self.simp.setNext(self.assigns.numberOfAssigns(), self.watches.propagations, self.db.clauses_literals + self.db.learnts_literals); // (shouldn't depend on stats really, but it will do for now)
 
         true
     }
 
     // Revert to the state at given level (keeping all assignment at 'level' but not beyond).
     fn cancelUntil(&mut self, target_level : DecisionLevel) {
-        let ref mut assigns = self.assigns;
         let ref mut heur = self.heur;
-
-        let top_level = self.trail.decisionLevel();
-        self.trail.cancelUntil(target_level,
-            |level, lit| {
-                let x = lit.var();
-                assigns.cancel(x);
-                heur.cancel(lit, level == top_level);
-            });
+        let top_level = self.assigns.decisionLevel();
+        self.assigns.rewindUntilLevel(target_level, |level, lit| { heur.cancel(lit, level == top_level); });
     }
 
-    fn solve_(&mut self) -> PartialResult {
+    pub fn solveLimited(&mut self, assumptions : &[Lit]) -> PartialResult {
         if !self.ok { return PartialResult::UnSAT; }
 
         self.stats.solves += 1;
@@ -451,20 +444,20 @@ impl CoreSolver {
         info!("|           |    Vars  Clauses Literals |    Limit  Clauses Lit/Cl |          |");
         info!("===============================================================================");
 
-        let result = self.searchLoop();
-        self.cancelUntil(0);
+        let result = self.searchLoop(assumptions);
+        self.cancelUntil(GroundLevel);
 
         info!("===============================================================================");
         result
     }
 
-    fn searchLoop(&mut self) -> PartialResult {
+    fn searchLoop(&mut self, assumptions : &[Lit]) -> PartialResult {
         let mut curr_restarts = 0;
         loop {
             let conflicts_to_go = self.restart.conflictsToGo(curr_restarts);
             curr_restarts += 1;
 
-            match self.search(conflicts_to_go) {
+            match self.search(conflicts_to_go, assumptions) {
                 SearchResult::SAT             => {
                     return PartialResult::SAT(self.assigns.extractModel());
                 }
@@ -495,30 +488,35 @@ impl CoreSolver {
     //   'l_True' if a partial assigment that is consistent with respect to the clauseset is found. If
     //   all variables are decision variables, this means that the clause set is satisfiable. 'l_False'
     //   if the clause set is unsatisfiable. 'l_Undef' if the bound on number of conflicts is reached.
-    fn search(&mut self, nof_conflicts : u64) -> SearchResult {
+    fn search(&mut self, nof_conflicts : u64, assumptions : &[Lit]) -> SearchResult {
         assert!(self.ok);
         self.stats.starts += 1;
 
         let mut conflictC = 0;
         loop {
-            match self.propagate() {
+            match self.watches.propagate(&mut self.db.ca, &mut self.assigns) {
                 Some(confl) => {
                     self.stats.conflicts += 1;
                     conflictC += 1;
-                    if self.trail.isGroundLevel() {
-                        return SearchResult::UnSAT;
-                    }
 
-                    let (backtrack_level, learnt_clause) = self.analyze.analyze(&mut self.db, &mut self.heur, &self.assigns, &self.trail, confl);
-                    self.cancelUntil(backtrack_level);
-                    match learnt_clause.len() {
-                        1 => { self.uncheckedEnqueue(learnt_clause[0], None) }
-                        _ => {
-                            let cr = self.db.learnClause(&learnt_clause);
-                            self.watches.watchClause(&self.db.ca[cr], cr);
-                            self.uncheckedEnqueue(learnt_clause[0], Some(cr));
+                    match self.analyze.analyze(&mut self.db, &mut self.heur, &self.assigns, confl) {
+                        Conflict::Ground => {
+                            return SearchResult::UnSAT;
+                        }
+
+                        Conflict::Unit(level, unit) => {
+                            self.cancelUntil(level);
+                            self.assigns.assignLit(unit, None);
+                        }
+
+                        Conflict::Learned(level, lit, clause) => {
+                            self.cancelUntil(level);
+                            let (c, cr) = self.db.learnClause(clause);
+                            self.watches.watchClause(c, cr);
+                            self.assigns.assignLit(lit, Some(cr));
                         }
                     }
+
 
                     self.heur.decayActivity();
                     self.db.decayActivity();
@@ -526,30 +524,30 @@ impl CoreSolver {
                     if self.learnt.bump() {
                         info!("| {:9} | {:7} {:8} {:8} | {:8} {:8} {:6.0} | {:6.3} % |",
                                self.stats.conflicts,
-                               self.heur.dec_vars - self.trail.levelSize(0),
+                               self.heur.dec_vars - self.assigns.numberOfGroundAssigns(),
                                self.nClauses(),
                                self.db.clauses_literals,
                                self.learnt.border(),
                                self.db.num_learnts,
                                (self.db.learnts_literals as f64) / (self.db.num_learnts as f64),
-                               progressEstimate(self.assigns.nVars(), &self.trail) * 100.0);
+                               progressEstimate(&self.assigns) * 100.0);
                     }
                 }
 
                 None        => {
                     if conflictC >= nof_conflicts || !self.budget.within(self.stats.conflicts, self.watches.propagations) {
                         // Reached bound on number of conflicts:
-                        let progress_estimate = progressEstimate(self.assigns.nVars(), &self.trail);
-                        self.cancelUntil(0);
+                        let progress_estimate = progressEstimate(&self.assigns);
+                        self.cancelUntil(GroundLevel);
                         return SearchResult::Interrupted(progress_estimate);
                     }
 
                     // Simplify the set of problem clauses:
-                    if self.trail.isGroundLevel() && !self.simplify() {
+                    if self.assigns.isGroundLevel() && !self.simplify() {
                         return SearchResult::UnSAT;
                     }
 
-                    if self.db.needReduce(self.trail.totalSize() + self.learnt.border()) {
+                    if self.db.needReduce(self.assigns.numberOfAssigns() + self.learnt.border()) {
                         // Reduce the set of learnt clauses:
                         self.db.reduce(&mut self.assigns, &mut self.watches);
                         if self.db.ca.checkGarbage(self.settings.garbage_frac) {
@@ -558,19 +556,19 @@ impl CoreSolver {
                     }
 
                     let mut next = None;
-                    while self.trail.decisionLevel() < self.assumptions.len() {
+                    while self.assigns.decisionLevel().offset() < assumptions.len() {
                         // Perform user provided assumption:
-                        let p = self.assumptions[self.trail.decisionLevel()];
+                        let p = assumptions[self.assigns.decisionLevel().offset()];
                         match self.assigns.ofLit(p) {
-                            Value::True  => {
+                            LitVal::True  => {
                                 // Dummy decision level:
-                                self.trail.newDecisionLevel();
+                                self.assigns.newDecisionLevel();
                             }
-                            Value::False => {
-                                let conflict = self.analyze.analyzeFinal(&self.db, &self.assigns, &self.trail, !p);
+                            LitVal::False => {
+                                let conflict = self.analyze.analyzeFinal(&self.db, &self.assigns, !p);
                                 return SearchResult::AssumpsConfl(conflict);
                             }
-                            Value::Undef => {
+                            LitVal::Undef => {
                                 next = Some(p);
                                 break;
                             }
@@ -590,28 +588,10 @@ impl CoreSolver {
                     };
 
                     // Increase decision level and enqueue 'next'
-                    self.trail.newDecisionLevel();
-                    self.uncheckedEnqueue(next.unwrap(), None);
+                    self.assigns.newDecisionLevel();
+                    self.assigns.assignLit(next.unwrap(), None);
                 }
             }
-        }
-    }
-
-    fn propagate(&mut self) -> Option<ClauseRef> {
-        self.watches.propagate(&mut self.trail, &mut self.assigns, &mut self.db.ca)
-    }
-
-    fn uncheckedEnqueue(&mut self, p : Lit, from : Option<ClauseRef>) {
-        self.assigns.assignLit(p, self.trail.decisionLevel(), from);
-        self.trail.push(p);
-    }
-
-    // NOTE: enqueue does not set the ok flag! (only public methods do)
-    fn enqueue(&mut self, p : Lit, from : Option<ClauseRef>) -> bool {
-        match self.assigns.ofLit(p) {
-            Value::Undef => { self.uncheckedEnqueue(p, from); true }
-            Value::True  => { true }
-            Value::False => { false }
         }
     }
 
@@ -625,17 +605,25 @@ impl CoreSolver {
 
     fn relocAll(&mut self, mut to : ClauseAllocator) {
         self.watches.relocGC(&mut self.db.ca, &mut to);
-        self.assigns.relocGC(&self.trail, &mut self.db.ca, &mut to);
+        self.assigns.relocGC(&mut self.db.ca, &mut to);
         self.db.relocGC(to);
     }
 }
 
 
-fn progressEstimate(vars : usize, trail : &PropagationTrail<Lit>) -> f64 {
-    let F = 1.0 / (vars as f64);
-    let mut progress = 0.0;
-    for i in 0 .. trail.decisionLevel() + 1 {
-        progress += F.powi(i as i32) * (trail.levelSize(i) as f64);
+fn isImplied(core : &mut CoreSolver, c : &[Lit]) -> bool {
+    assert!(core.assigns.isGroundLevel());
+
+    core.assigns.newDecisionLevel();
+    for lit in c.iter() {
+        match core.assigns.ofLit(*lit) {
+            LitVal::True  => { core.cancelUntil(GroundLevel); return true; }
+            LitVal::Undef => { core.assigns.assignLit(!*lit, None); }
+            LitVal::False => {}
+        }
     }
-    progress * F
+
+    let result = core.watches.propagate(&mut core.db.ca, &mut core.assigns).is_some();
+    core.cancelUntil(GroundLevel);
+    return result;
 }

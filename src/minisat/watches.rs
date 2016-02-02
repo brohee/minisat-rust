@@ -2,7 +2,6 @@ use minisat::formula::{Lit, Var};
 use minisat::formula::index_map::LitMap;
 use minisat::formula::clause::*;
 use minisat::formula::assignment::*;
-use minisat::propagation_trail::*;
 
 
 #[derive(Clone)]
@@ -79,15 +78,15 @@ impl Watches {
     //
     //   Post-conditions:
     //     * the propagation queue is empty, even if there was a conflict.
-    pub fn propagate(&mut self, trail : &mut PropagationTrail<Lit>, assigns : &mut Assignment, ca : &mut ClauseAllocator) -> Option<ClauseRef> {
-        while let Some(p) = trail.dequeue() {
+    pub fn propagate(&mut self, ca : &mut ClauseAllocator, assigns : &mut Assignment) -> Option<ClauseRef> {
+        while let Some(p) = assigns.dequeue() {
             self.propagations += 1;
             let false_lit = !p;
 
             {
                 let ref mut line = self.watches[&p];
                 if line.dirty {
-                    line.watchers.retain(|w| { !ca[w.cref].is_deleted() });
+                    line.watchers.retain(|w| { !ca.isDeleted(w.cref) });
                     line.dirty = false;
                 }
             }
@@ -101,7 +100,7 @@ impl Watches {
                     let pwi = p_watches[i].clone();
                     i += 1;
 
-                    if assigns.sat(pwi.blocker) {
+                    if assigns.isSat(pwi.blocker) {
                         p_watches[j] = pwi;
                         j += 1;
                         continue;
@@ -109,14 +108,13 @@ impl Watches {
 
                     let c = ca.edit(pwi.cref);
                     if c[0] == false_lit {
-                        c[0] = c[1];
-                        c[1] = false_lit;
+                        c.swap(0, 1);
                     }
                     assert!(c[1] == false_lit);
 
                     // If 0th watch is true, then clause is already satisfied.
                     let cw = Watcher { cref : pwi.cref, blocker : c[0] };
-                    if cw.blocker != pwi.blocker && assigns.sat(cw.blocker) {
+                    if cw.blocker != pwi.blocker && assigns.isSat(cw.blocker) {
                         p_watches[j] = cw;
                         j += 1;
                         continue;
@@ -125,10 +123,9 @@ impl Watches {
                     // Look for new watch:
                     let mut new_watch = None;
                     for k in 2 .. c.len() {
-                        if !assigns.unsat(c[k]) {
-                            let lit = c[k];
-                            c[1] = lit;
-                            c[k] = false_lit;
+                        let lit = c[k];
+                        if !assigns.isUnsat(lit) {
+                            c.swap(1, k);
                             new_watch = Some(lit);
                             break;
                         }
@@ -148,8 +145,8 @@ impl Watches {
                         p_watches[j] = cw.clone();
                         j += 1;
 
-                        if assigns.unsat(cw.blocker) {
-                            trail.dequeueAll();
+                        if assigns.isUnsat(cw.blocker) {
+                            assigns.dequeueAll();
 
                             // Copy the remaining watches:
                             while i < p_watches.len() {
@@ -161,8 +158,7 @@ impl Watches {
                             p_watches.truncate(j);
                             return Some(cw.cref);
                         } else {
-                            assigns.assignLit(cw.blocker, trail.decisionLevel(), Some(cw.cref));
-                            trail.push(cw.blocker);
+                            assigns.assignLit(cw.blocker, Some(cw.cref));
                         }
                     }
                 }
@@ -177,7 +173,7 @@ impl Watches {
     pub fn relocGC(&mut self, from : &mut ClauseAllocator, to : &mut ClauseAllocator) {
         for (_, line) in self.watches.iter_mut() {
             line.dirty = false;
-            line.watchers.retain(|w| { !from[w.cref].is_deleted() });
+            line.watchers.retain(|w| { !from.isDeleted(w.cref) });
             for w in line.watchers.iter_mut() {
                 w.cref = from.relocTo(to, w.cref);
             }
