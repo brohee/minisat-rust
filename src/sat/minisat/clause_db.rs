@@ -1,9 +1,9 @@
 use std::cmp::Ordering;
-use minisat::formula::Lit;
-use minisat::formula::assignment::*;
-use minisat::formula::clause::*;
-use minisat::formula::util::*;
-use minisat::watches::*;
+use sat::formula::Lit;
+use sat::formula::assignment::Assignment;
+use sat::formula::clause::*;
+use sat::formula::util::*;
+use super::watches::Watches;
 
 
 pub struct ClauseDBSettings {
@@ -170,7 +170,7 @@ impl ClauseDB {
             false
         } else {
             let c = self.ca.edit(cr);
-            assert!(assigns.isUndef(c[0].var()) && assigns.isUndef(c[1].var()));
+            assert!({ let (c0, c1) = c.headPair(); assigns.isUndef(c0.var()) && assigns.isUndef(c1.var()) });
             c.retainSuffix(2, |lit| !assigns.isUnsat(*lit));
             true
         }

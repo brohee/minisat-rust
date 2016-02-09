@@ -1,10 +1,9 @@
-use minisat::formula::{Lit, Var};
-use minisat::formula::index_map::LitMap;
-use minisat::formula::clause::*;
-use minisat::formula::assignment::*;
+use sat::formula::{Lit, Var, LitMap};
+use sat::formula::assignment::Assignment;
+use sat::formula::clause::*;
 
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 struct Watcher {
     pub cref    : ClauseRef,
     pub blocker : Lit
@@ -30,8 +29,8 @@ impl Watches {
     }
 
     pub fn initVar(&mut self, var : Var) {
-        self.initLit(Lit::new(var, false));
-        self.initLit(Lit::new(var, true));
+        self.initLit(var.posLit());
+        self.initLit(var.negLit());
     }
 
     fn initLit(&mut self, lit : Lit) {
@@ -42,8 +41,8 @@ impl Watches {
     }
 
     pub fn tryClearVar(&mut self, var : Var) {
-        self.tryClearLit(Lit::new(var, false));
-        self.tryClearLit(Lit::new(var, true));
+        self.tryClearLit(var.posLit());
+        self.tryClearLit(var.negLit());
     }
 
     fn tryClearLit(&mut self, lit : Lit) {
@@ -53,23 +52,23 @@ impl Watches {
     }
 
     pub fn watchClause(&mut self, c : &Clause, cr : ClauseRef) {
-        assert!(c.len() > 1);
-        self.watches[&!c[0]].watchers.push(Watcher { cref : cr, blocker : c[1] });
-        self.watches[&!c[1]].watchers.push(Watcher { cref : cr, blocker : c[0] });
+        let (c0, c1) = c.headPair();
+        self.watches[&!c0].watchers.push(Watcher { cref : cr, blocker : c1 });
+        self.watches[&!c1].watchers.push(Watcher { cref : cr, blocker : c0 });
     }
 
     pub fn unwatchClauseStrict(&mut self, c : &Clause, cr : ClauseRef)
     {
-        assert!(c.len() > 1);
-        self.watches[&!c[0]].watchers.retain(|w| w.cref != cr);
-        self.watches[&!c[1]].watchers.retain(|w| w.cref != cr);
+        let (c0, c1) = c.headPair();
+        self.watches[&!c0].watchers.retain(|w| w.cref != cr);
+        self.watches[&!c1].watchers.retain(|w| w.cref != cr);
     }
 
     pub fn unwatchClauseLazy(&mut self, c : &Clause)
     {
-        assert!(c.len() > 1);
-        self.watches[&!c[0]].dirty = true;
-        self.watches[&!c[1]].dirty = true;
+        let (c0, c1) = c.headPair();
+        self.watches[&!c0].dirty = true;
+        self.watches[&!c1].dirty = true;
     }
 
     // Description:
@@ -97,7 +96,7 @@ impl Watches {
                 let (cw, new_watch) = {
                     let ref mut p_watches = self.watches[&p].watchers;
                     if i >= p_watches.len() { break; }
-                    let pwi = p_watches[i].clone();
+                    let pwi = p_watches[i];
                     i += 1;
 
                     if assigns.isSat(pwi.blocker) {
@@ -107,13 +106,13 @@ impl Watches {
                     }
 
                     let c = ca.edit(pwi.cref);
-                    if c[0] == false_lit {
+                    if c.head() == false_lit {
                         c.swap(0, 1);
                     }
                     assert!(c[1] == false_lit);
 
                     // If 0th watch is true, then clause is already satisfied.
-                    let cw = Watcher { cref : pwi.cref, blocker : c[0] };
+                    let cw = Watcher { cref : pwi.cref, blocker : c.head() };
                     if cw.blocker != pwi.blocker && assigns.isSat(cw.blocker) {
                         p_watches[j] = cw;
                         j += 1;
@@ -121,17 +120,7 @@ impl Watches {
                     }
 
                     // Look for new watch:
-                    let mut new_watch = None;
-                    for k in 2 .. c.len() {
-                        let lit = c[k];
-                        if !assigns.isUnsat(lit) {
-                            c.swap(1, k);
-                            new_watch = Some(lit);
-                            break;
-                        }
-                    }
-
-                    (cw, new_watch)
+                    (cw, c.pullLiteral(1, |lit| { !assigns.isUnsat(lit) }))
                 };
 
                 match new_watch {
@@ -142,7 +131,7 @@ impl Watches {
                     // Did not find watch -- clause is unit under assignment:
                     None      => {
                         let ref mut p_watches = self.watches[&p].watchers;
-                        p_watches[j] = cw.clone();
+                        p_watches[j] = cw;
                         j += 1;
 
                         if assigns.isUnsat(cw.blocker) {
@@ -150,7 +139,7 @@ impl Watches {
 
                             // Copy the remaining watches:
                             while i < p_watches.len() {
-                                p_watches[j] = p_watches[i].clone();
+                                p_watches[j] = p_watches[i];
                                 j += 1;
                                 i += 1;
                             }

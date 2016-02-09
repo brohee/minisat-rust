@@ -3,9 +3,8 @@ use std::io;
 use std::str;
 use std::borrow::Borrow;
 use std::collections::{HashSet, HashMap};
-use minisat::formula::{Var, Lit};
-use minisat::formula::index_map::VarMap;
-use minisat::solver::Solver;
+use sat::formula::{Var, Lit, VarMap};
+use sat::Solver;
 
 
 pub fn write<W : io::Write, S : Solver>(_ : &mut W, _ : &S) -> io::Result<()> {
@@ -92,7 +91,7 @@ impl<'s, S : Solver> Subst<'s, S> {
             }
         }
 
-        Lit::new(self.forward_subst[&lit_id.abs()], lit_id < 0)
+        self.forward_subst[&lit_id.abs()].lit(lit_id < 0)
     }
 
     fn newVar(&mut self, var_id : i32) {

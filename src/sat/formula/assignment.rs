@@ -11,8 +11,7 @@ pub const GroundLevel : DecisionLevel = DecisionLevel(0);
 
 impl DecisionLevel {
     pub fn offset(&self) -> usize {
-        let DecisionLevel(level) = *self;
-        level
+        self.0
     }
 }
 
@@ -32,7 +31,7 @@ impl LitVal {
 }
 
 
-struct VarData {
+pub struct VarData {
     pub reason : Option<clause::ClauseRef>,
     pub level  : DecisionLevel
 }
@@ -229,19 +228,6 @@ impl Assignment {
     }
 
 
-    pub fn extractModel(&self) -> VarMap<bool> {
-        let mut model = VarMap::new();
-        for i in 0 .. self.assignment.len() {
-            match self.assignment[i].assign[0] {
-                LitVal::Undef => {}
-                LitVal::False => { model.insert(&Var(i), false); }
-                LitVal::True  => { model.insert(&Var(i), true); }
-            }
-        }
-        model
-    }
-
-
     pub fn relocGC(&mut self, from : &mut clause::ClauseAllocator, to : &mut clause::ClauseAllocator) {
         for l in self.trail.iter() {
             let Var(v) = l.var();
@@ -260,7 +246,7 @@ impl Assignment {
     }
 
     pub fn isLocked(&self, ca : &clause::ClauseAllocator, cr : clause::ClauseRef) -> bool {
-        let lit = ca.view(cr)[0];
+        let lit = ca.view(cr).head();
         if !self.isSat(lit) { return false; }
         match self.vardata(lit.var()).reason {
             Some(r) if cr == r => { true }
@@ -271,7 +257,7 @@ impl Assignment {
     pub fn forgetReason(&mut self, ca : &clause::ClauseAllocator, cr : clause::ClauseRef) {
         // Don't leave pointers to free'd memory!
         if self.isLocked(ca, cr) {
-            let Var(v) = ca.view(cr)[0].var();
+            let Var(v) = ca.view(cr).head().var();
             self.assignment[v].vd.reason = None;
         }
     }
@@ -289,6 +275,19 @@ pub fn progressEstimate(assigns : &Assignment) -> f64 {
         progress += F.powi(level as i32) * ((r - l) as f64);
     }
     progress * F
+}
+
+
+pub fn extractModel(assigns : &Assignment) -> VarMap<bool> {
+    let mut model = VarMap::new();
+    for i in 0 .. assigns.assignment.len() {
+        match assigns.assignment[i].assign[0] {
+            LitVal::Undef => {}
+            LitVal::False => { model.insert(&Var(i), false); }
+            LitVal::True  => { model.insert(&Var(i), true); }
+        }
+    }
+    model
 }
 
 
