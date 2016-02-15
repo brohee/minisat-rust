@@ -1,5 +1,9 @@
 language: rust
 
+install:
+  - sudo apt-get update
+  - sudo apt-get install minisat
+
 rust:
   - nightly
   - beta
@@ -8,3 +12,7 @@ rust:
 matrix:
   allow_failures:
     - rust: nightly
+
+script:
+  - cargo build --release --verbose
+  - cargo test --release --verbose

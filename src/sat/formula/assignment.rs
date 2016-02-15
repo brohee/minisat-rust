@@ -1,4 +1,4 @@
-use std::cmp;
+use std::{cmp, fmt};
 use super::{Var, Lit};
 use super::clause;
 use super::index_map::VarMap;
@@ -75,8 +75,8 @@ impl Assignment {
     #[inline]
     pub fn numberOfGroundAssigns(&self) -> usize {
         match self.lim.first() {
-            Some(lim) => { *lim }
-            None      => { self.trail.len() }
+            Some(&lim) => { lim }
+            None       => { self.trail.len() }
         }
     }
 
@@ -260,6 +260,25 @@ impl Assignment {
             let Var(v) = ca.view(cr).head().var();
             self.assignment[v].vd.reason = None;
         }
+    }
+}
+
+impl fmt::Debug for Assignment {
+    fn fmt(&self, f : &mut fmt::Formatter) -> fmt::Result {
+        for level in 0 .. 1 + self.lim.len() {
+            let l = if level > 0 { self.lim[level - 1] } else { 0 };
+            let r = if level < self.lim.len() { self.lim[level] } else { self.trail.len() };
+
+            if r > l {
+                try!(write!(f, "[{}:", level));
+                for i in l .. r {
+                    try!(write!(f, " {:?}", self.trail[i]));
+                }
+                try!(write!(f, " ]"));
+            }
+        }
+
+        Ok(())
     }
 }
 
